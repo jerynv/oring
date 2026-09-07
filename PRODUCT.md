@@ -36,11 +36,11 @@ A ring already paired by another app needs its existing 32-character pairing key
 ## Evidence on Hand
 
 - MIT-licensed open_health at commit `5569be1` and pinned open_oura dependency at `99e0f4c4`; the latter documents direct BLE pairing, event sync, and ring sleep-phase data.
-- Simulator UI and sample report tests passed; no physical Oura ring or pairing key is available in this workspace.
+- Simulator UI and sample report tests passed. Fresh pairing, live battery, and event sync were exercised on an iPhone 16 Pro Max with a physical ring. An overnight sleep-stage report still needs a captured night.
 
 ## Product Principles
 
 - Show the source and say when data is sample or unavailable.
 - Make pairing consequences explicit before any destructive step.
 - Keep personal ring data on-device.
-- Use native iOS controls and support light/dark appearances.
+- Use Apple system typography and a quiet dark space setting. Guide pairing one step at a time, with technical controls available on request.

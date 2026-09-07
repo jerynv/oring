@@ -15,13 +15,14 @@
 ## Owner release steps
 
 1. Assign the final bundle identifier and Apple Developer team. Build the Rust device and simulator library with `apps/ios/build-xcframework.sh`, generate the Xcode project from `apps/ios/OuraApp/project.yml`, and archive a signed Release build.
-2. Test a physical compatible ring end to end: key entry or fresh pairing, Bluetooth permission, event sync, the ring's stage epochs, REM graph, and trends. Check reconnects and firmware behavior. Do not factory-reset the owner's ring without backing up any unsynced data and obtaining their direct approval.
+2. Complete the physical-ring sleep test: a full overnight capture, the ring's stage epochs, REM graph, and trends. Fresh pairing, Bluetooth permission, battery, and event sync have already run on the owner's ring. Check reconnects and firmware behavior. Do not factory-reset the owner's ring without backing up any unsynced data and obtaining their direct approval.
 3. Host [the privacy policy](privacy-policy.md) at a public HTTPS URL. Supply real support contact and help pages that explain the existing-key and factory-reset paths. Review the app's final privacy answers and linked libraries.
 4. Capture final App Store screenshots from the signed app in App Store Connect's required sizes. Keep the “Sample data” label visible on demo screenshots; never portray it as a user's measurement.
 5. In App Review notes, say the app uses Bluetooth Low Energy to communicate with a physical Oura ring and identify at least one specific supported ring model tested. Explain that the reviewer can tap **Explore a sample night** without hardware. Provide any test instructions Apple asks for.
 6. Answer App Store Connect's encryption export questionnaire based on the Rust library's AES use and planned distribution regions. The project deliberately leaves `ITSAppUsesNonExemptEncryption` unset pending that determination. Submit any required documents.
 7. Set pricing to Free, complete age rating and availability, then upload and submit through Xcode Organizer/App Store Connect. Check the final app name and compatibility wording against Apple's current review rules before submission.
+8. Review the final name, icon, ring art, and listing for trademark confusion before release. The bundled ring artwork is original and unbranded; the listing should identify Oura only to explain compatibility and keep the independent-app statement visible.
 
 ## Current evidence and limit
 
-The simulator build, labeled sample report, pairing entry screen, 9 automated tests, and an unsigned Release archive have run. This workspace has no physical Oura ring, pairing key, Apple Developer signing identity, or App Store Connect access. Real Bluetooth behavior and App Store approval remain unproven.
+The simulator build and labeled sample report have run. A signed development build paired and synced with a physical ring on an iPhone 16 Pro Max; battery and new event counts were visible in the app. A real overnight sleep-stage report, App Store archive, public privacy URL, and App Store Connect submission remain open.

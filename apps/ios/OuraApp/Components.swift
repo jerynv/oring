@@ -201,8 +201,13 @@ struct VitalCell: View {
                 }
             }
             HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(value).font(Obs.mono(26, .medium)).foregroundStyle(Obs.ink).monospacedDigit()
-                Text(unit).font(Obs.mono(11)).foregroundStyle(Obs.ink2)
+                if value == "–" {
+                    Label("Awaiting data", systemImage: "waveform.path")
+                        .font(.subheadline).foregroundStyle(Obs.muted)
+                } else {
+                    Text(value).font(Obs.mono(26, .medium)).foregroundStyle(Obs.ink).monospacedDigit()
+                    Text(unit).font(Obs.mono(11)).foregroundStyle(Obs.ink2)
+                }
             }
             if let d = delta {
                 Text("\(d >= 0 ? "+" : "")\(d, specifier: "%.0f")% vs base")
@@ -331,11 +336,13 @@ struct VitalTrendView: View {
                             }
                             .obsCard()
                         } else if all.isEmpty {
-                            Text("No readings yet.")
-                                .font(Obs.mono(12)).foregroundStyle(Obs.ink2)
+                            SpaceEmptyState(symbol: "waveform.path.ecg", title: "No nightly trend yet",
+                                            message: "Wear your ring overnight, then sync to see this pattern over time.")
+                                .padding(.top, 24)
                         } else {
-                            Text("Not enough nights in this period yet.")
-                                .font(Obs.mono(12)).foregroundStyle(Obs.ink2)
+                            SpaceEmptyState(symbol: "chart.xyaxis.line", title: "A little more time",
+                                            message: "Choose a longer period above or keep wearing your ring to build a trend.")
+                                .padding(.top, 24)
                         }
                     }
                     .padding(24)

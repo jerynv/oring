@@ -47,6 +47,8 @@ targets:
       - path: Theme.swift
       - path: BLETransport.swift
       - path: RingSync.swift
+      - path: BackgroundSync.swift
+      - path: RingSyncVisual.swift
       - path: ProfileSettings.swift
       - path: ModelProgress.swift
       - path: CrashCatch.c

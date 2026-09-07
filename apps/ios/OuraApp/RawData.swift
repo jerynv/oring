@@ -63,6 +63,7 @@ enum RawData {
     }
 
     static func load(filter: String, limit: UInt32 = 400) -> (kinds: [Kind], events: [Event], error: String?) {
+        guard FileManager.default.fileExists(atPath: DB.url.path) else { return ([], [], nil) }
         let raw = eventsJson(dbPath: DB.url.path, nameFilter: filter, limit: limit)
         guard let data = raw.data(using: .utf8),
               let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
@@ -120,11 +121,18 @@ struct RawDataView: View {
                 } else if loading {
                     ProgressView().tint(Obs.ink).frame(maxWidth: .infinity)
                 } else if kinds.isEmpty {
-                    Text("Nothing stored yet. Sync the ring and come back.")
-                        .font(.subheadline).foregroundStyle(Obs.ink2)
+                    SpaceEmptyState(symbol: "waveform.path", title: "No events yet",
+                                    message: "Once the ring sends its first batch, the raw signal details will appear here.")
+                        .padding(.top, 58)
                 } else {
                     kindList
-                    if !filter.isEmpty { chart; eventList }
+                    if !filter.isEmpty {
+                        if events.isEmpty {
+                            SpaceEmptyState(symbol: "line.3.horizontal.decrease", title: "Nothing in this view",
+                                            message: "This event type has no saved entries yet. Choose another type above.")
+                                .padding(.top, 20)
+                        } else { chart; eventList }
+                    }
                 }
             }
             .padding(20)

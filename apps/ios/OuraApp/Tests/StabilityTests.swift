@@ -1,8 +1,97 @@
 import XCTest
 import SQLite3
+import CoreBluetooth
 @testable import OuraApp
 
 final class StabilityTests: XCTestCase {
+    func testResettingRingKeepsLocalEventsAndRestartsCursor() throws {
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".db")
+        defer { try? FileManager.default.removeItem(at: path) }
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path.path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(sqlite3_exec(db, "CREATE TABLE sync_state(serial TEXT PRIMARY KEY, next_cursor INTEGER); CREATE TABLE events(id INTEGER); INSERT INTO sync_state VALUES ('R1', 95); INSERT INTO events VALUES (7);", nil, nil, nil), SQLITE_OK)
+
+        try DB.resetSyncCursor(for: "R1", at: path)
+
+        var cursor: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT next_cursor FROM sync_state WHERE serial = 'R1'", -1, &cursor, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(cursor), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int(cursor, 0), 0)
+        sqlite3_finalize(cursor)
+        var count: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM events", -1, &count, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(count), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int(count, 0), 1)
+        sqlite3_finalize(count)
+    }
+
+    @MainActor
+    func testDeleteAllLocalDataRemovesRingHistoryProfileAndKey() async throws {
+        let database = DB.url
+        let profile = database.deletingLastPathComponent().appendingPathComponent("profile.json")
+        let defaults = UserDefaults.standard
+        try Data("temporary ring history".utf8).write(to: database)
+        try Data("{\"age\":35}".utf8).write(to: profile)
+        Keychain.saveKey("0123456789abcdef0123456789abcdef")
+        defaults.set("test-ring", forKey: "ring.serial")
+        defaults.set(19, forKey: "ring.last-inserted-count")
+
+        let deleted = await RingSync().deleteAllLocalData()
+
+        XCTAssertTrue(deleted)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: database.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: profile.path))
+        XCTAssertNil(Keychain.loadKey())
+        XCTAssertNil(defaults.string(forKey: "ring.serial"))
+        XCTAssertNil(defaults.object(forKey: "ring.last-inserted-count"))
+    }
+
+    func testDeletingDiagnosticsClearsRetainedRecords() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = DiagStore(directory: directory, segmentLimit: 2048, totalLimit: 8192)
+        store.append("before deletion")
+        store.flush()
+        XCTAssertTrue(store.exportAll().contains("before deletion"))
+        try store.clearStoredData()
+        XCTAssertFalse(store.exportAll().contains("before deletion"))
+    }
+
+    @MainActor
+    func testLastSyncCountSurvivesRelaunch() {
+        let defaults = UserDefaults.standard
+        let timeKey = "ring.last-successful-sync-at"
+        let countKey = "ring.last-inserted-count"
+        let oldTime = defaults.object(forKey: timeKey)
+        let oldCount = defaults.object(forKey: countKey)
+        defer {
+            if let oldTime { defaults.set(oldTime, forKey: timeKey) } else { defaults.removeObject(forKey: timeKey) }
+            if let oldCount { defaults.set(oldCount, forKey: countKey) } else { defaults.removeObject(forKey: countKey) }
+        }
+        defaults.set(Date().timeIntervalSince1970, forKey: timeKey)
+        defaults.set(120, forKey: countKey)
+        XCTAssertEqual(RingSync().lastInsertedCount, 120)
+    }
+
+    func testStaleBluetoothBondGetsSpecificRecovery() {
+        let error = NSError(domain: CBErrorDomain, code: 14)
+        if case BLEError.staleBond = BLEError.connectionFailure(error) {
+            // This error needs an iOS Bluetooth forget, not another connection retry.
+        } else {
+            XCTFail("CoreBluetooth stale bond was not recognized")
+        }
+        let other = NSError(domain: CBErrorDomain, code: 7)
+        XCTAssertEqual((BLEError.connectionFailure(other) as NSError).code, 7)
+    }
+
+    func testCheckingBeforeFirstSyncDoesNotReportSqliteFailure() {
+        let missing = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString).appendingPathComponent("oura.db")
+        XCTAssertEqual(DB.integrityMessage(path: missing.path),
+                       "No saved ring data yet. Sync your ring first.")
+    }
+
     func testSampleNightHasRingStageData() {
         let sample = SampleData.summary()
         XCTAssertNotNil(sample)

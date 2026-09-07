@@ -121,10 +121,12 @@ struct HourlyHeartRateSection: View {
                 Text(error).font(Obs.mono(12)).foregroundStyle(Obs.bad)
                     .fixedSize(horizontal: false, vertical: true)
             } else if visible.isEmpty {
-                Text(loading ? "Reading the ring database…"
-                             : "No beats stored for this window yet. Sync the ring.")
-                    .font(Obs.mono(12)).foregroundStyle(Obs.ink2)
-                    .fixedSize(horizontal: false, vertical: true)
+                if loading {
+                    ProgressView("Reading heart data…").tint(Obs.link)
+                } else {
+                    SpaceEmptyState(symbol: "heart.text.square", title: "No beats in this window",
+                                    message: "Choose a longer window or sync after wearing your ring.")
+                }
             } else {
                 readout
                 HourlyRangeChart(bars: visible, window: window, selected: $selected)

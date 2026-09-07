@@ -1,9 +1,7 @@
 import SwiftUI
 import UIKit
 
-// thomas.md Quiet Ink: warm paper, serif titles, sans UI, mono numbers.
-// Color is semantic, not decorative: gray when nothing is going on, green when
-// something is genuinely good, orange/red when there is a problem.
+// A quiet night sky, with Apple's system type and stage colors used consistently.
 
 enum Obs {
     private static func adaptive(light: UInt32, dark: UInt32) -> Color {
@@ -17,17 +15,16 @@ enum Obs {
         })
     }
 
-    // Night-sky almanac: warm paper by day and deep ink by night.
-    static let paper = adaptive(light: 0xf7f5ef, dark: 0x101b25)
-    static let ink = adaptive(light: 0x172b38, dark: 0xf4f1e9)
-    static let ink2 = adaptive(light: 0x465969, dark: 0xc4d0d7)
-    static let muted = adaptive(light: 0x5e6b74, dark: 0xacc0cb)
-    static let link = adaptive(light: 0x99520f, dark: 0xf2ac63)
-    static let rule = adaptive(light: 0xd8ddd8, dark: 0x344450)
-    static let chart = adaptive(light: 0x204d6c, dark: 0x5b9fc2)
-    static let good = adaptive(light: 0x327868, dark: 0x8ad0b8)
-    static let bad = adaptive(light: 0x99520f, dark: 0xe4aa69)
-    static let alert = adaptive(light: 0xa6432b, dark: 0xed8d77)
+    static let paper = adaptive(light: 0x080e1e, dark: 0x080e1e)
+    static let ink = adaptive(light: 0xf6f8ff, dark: 0xf6f8ff)
+    static let ink2 = adaptive(light: 0xc7d1e5, dark: 0xc7d1e5)
+    static let muted = adaptive(light: 0x9caec9, dark: 0x9caec9)
+    static let link = adaptive(light: 0xb8c9ff, dark: 0xb8c9ff)
+    static let rule = adaptive(light: 0x26344d, dark: 0x26344d)
+    static let chart = adaptive(light: 0x91b4ff, dark: 0x91b4ff)
+    static let good = adaptive(light: 0xa1ddca, dark: 0xa1ddca)
+    static let bad = adaptive(light: 0xe5c18d, dark: 0xe5c18d)
+    static let alert = adaptive(light: 0xf1a9a5, dark: 0xf1a9a5)
 
     static var teal: Color { chart }
     static var yellow: Color { bad }
@@ -38,10 +35,10 @@ enum Obs {
     static var trace: Color { rule }
     static var canvas: some View { paper.ignoresSafeArea() }
 
-    static let deep = adaptive(light: 0x204d6c, dark: 0x5b9fc2)
-    static let light = adaptive(light: 0x78a9b7, dark: 0xa6cbd4)
-    static let rem = adaptive(light: 0x327868, dark: 0x8ad0b8)
-    static let wake = adaptive(light: 0xb37530, dark: 0xe4aa69)
+    static let deep = adaptive(light: 0x6e8ff4, dark: 0x6e8ff4)
+    static let light = adaptive(light: 0xa9c3eb, dark: 0xa9c3eb)
+    static let rem = adaptive(light: 0x9fddcf, dark: 0x9fddcf)
+    static let wake = adaptive(light: 0xe4c5a2, dark: 0xe4c5a2)
     static func stage(_ s: Int) -> Color {
         switch s { case 1: return deep; case 2: return light; case 3: return rem; default: return wake }
     }
@@ -65,10 +62,10 @@ enum Obs {
     }
 
     static func serif(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
-        .system(size: size, weight: weight, design: .serif)
+        .system(size: size, weight: weight, design: .default)
     }
     static func mono(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
-        .system(size: size, weight: weight, design: .monospaced)
+        .system(size: max(size, 11), weight: weight, design: .default)
     }
     static func prose(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
         .system(size: size, weight: weight)
@@ -130,8 +127,53 @@ struct ObsStat: View {
         HStack(alignment: .firstTextBaseline) {
             Text(label).font(Obs.mono(13)).foregroundStyle(Obs.ink2)
             Spacer(minLength: 16)
-            Text(value).font(Obs.mono(15, .medium)).foregroundStyle(accent)
+            Text(value == "–" ? "Not yet" : value)
+                .font(Obs.mono(15, .medium))
+                .foregroundStyle(value == "–" ? Obs.muted : accent)
                 .monospacedDigit()
+        }
+    }
+}
+
+struct SpaceEmptyState: View {
+    let symbol: String
+    let title: String
+    let message: String
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var glowing = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ZStack(alignment: .leading) {
+                Ellipse()
+                    .fill(Obs.link.opacity(glowing ? 0.19 : 0.10))
+                    .frame(width: 150, height: 66)
+                    .blur(radius: 30)
+                    .offset(x: -14, y: 18)
+                Image(systemName: symbol)
+                    .font(.system(size: 58, weight: .ultraLight))
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(Obs.link)
+                    .shadow(color: Obs.link.opacity(0.35), radius: glowing ? 18 : 7)
+            }
+                .frame(width: 150, height: 110, alignment: .leading)
+                .accessibilityHidden(true)
+            Text(title)
+                .font(.system(.title2, design: .default, weight: .semibold))
+                .foregroundStyle(Obs.ink)
+                .padding(.top, 15)
+            Text(message)
+                .font(.body)
+                .foregroundStyle(Obs.ink2)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.top, 10)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onAppear {
+            guard !reduceMotion else { return }
+            withAnimation(.easeInOut(duration: 3.5).repeatForever(autoreverses: true)) {
+                glowing = true
+            }
         }
     }
 }

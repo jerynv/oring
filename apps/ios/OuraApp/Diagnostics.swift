@@ -141,6 +141,27 @@ final class DiagStore: NSObject, ObservableObject, @unchecked Sendable {
 
     func flush() { queue.sync { try? file?.synchronize() } }
 
+    func clearStoredData() throws {
+        try queue.sync {
+            let fm = FileManager.default
+            try? file?.close(); file = nil
+            try? signalFile?.close(); signalFile = nil
+            if fm.fileExists(atPath: root.path) { try fm.removeItem(at: root) }
+            for name in ["", "crashes", "sessions"] {
+                try fm.createDirectory(at: root.appendingPathComponent(name), withIntermediateDirectories: true)
+            }
+            let signal = root.appendingPathComponent("signal.log")
+            fm.createFile(atPath: signal.path, contents: nil)
+            signalFile = try FileHandle(forWritingTo: signal)
+            crashcatch_install(signalFile?.fileDescriptor ?? -1)
+            openLive()
+        }
+        DispatchQueue.main.async {
+            self.incidents = []
+            self.sessions = []
+        }
+    }
+
     private func openLive() {
         FileManager.default.createFile(atPath: live.path, contents: nil)
         file = try? FileHandle(forWritingTo: live)

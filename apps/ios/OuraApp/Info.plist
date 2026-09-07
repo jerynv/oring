@@ -25,6 +25,11 @@
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>bluetooth-central</string>
+		<string>processing</string>
+	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.jerynv.oring.sync</string>
 	</array>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Oring connects to your Oura ring over Bluetooth to read your health data on-device.</string>

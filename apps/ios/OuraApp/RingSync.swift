@@ -3,6 +3,7 @@ import Security
 import os
 import Darwin
 import UIKit
+import SQLite3
 
 // Shared debug logger for the connect + auth + sync path. View live in Console.app
 // (filter subsystem `md.thomas.openoura`). Stage/progress records replace raw
@@ -225,6 +226,14 @@ enum DB {
         return Bundle.main.path(forResource: "oura", ofType: "db") ?? p
     }
 
+    static func integrityMessage(path: String) -> String {
+        guard FileManager.default.fileExists(atPath: path) else {
+            return "No saved ring data yet. Sync your ring first."
+        }
+        do { return "Database check: \(try databaseIntegrity(dbPath: path))" }
+        catch { return "Database check failed: \(error)" }
+    }
+
     /// Drop the writable synced DB. The bundled seed remains intact; the next sync
     /// starts from an empty local store and drains the ring from cursor 0.
     static func resetWritableStore() throws {
@@ -232,6 +241,35 @@ enum DB {
         for suffix in ["", "-wal", "-shm"] {
             let file = URL(fileURLWithPath: p.path + suffix)
             if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
+        }
+    }
+
+    /// Re-read a freshly reset ring from the beginning while retaining the
+    /// history already saved on this iPhone. Exact duplicate events are ignored
+    /// by the store's unique event constraint.
+    static func resetSyncCursor(for serial: String, at dbURL: URL = DB.url) throws {
+        guard FileManager.default.fileExists(atPath: dbURL.path) else { return }
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
+            defer { if db != nil { sqlite3_close(db) } }
+            throw NSError(domain: "OringDatabase", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not open saved ring history"])
+        }
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        let sql = "UPDATE sync_state SET next_cursor = 0 WHERE serial = ?"
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw NSError(domain: "OringDatabase", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not prepare sync reset"])
+        }
+        defer { sqlite3_finalize(statement) }
+        let result = serial.withCString { value -> Int32 in
+            guard sqlite3_bind_text(statement, 1, value, -1, nil) == SQLITE_OK else { return SQLITE_MISUSE }
+            return sqlite3_step(statement)
+        }
+        guard result == SQLITE_DONE else {
+            throw NSError(domain: "OringDatabase", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not reset sync position"])
         }
     }
 }
@@ -309,19 +347,22 @@ final class SyncProgressBridge: SyncProgressListener, @unchecked Sendable {
 /// Orchestrates a sync and exposes progress to the UI.
 @MainActor
 final class RingSync: ObservableObject {
+    static let shared = RingSync()
     @Published var status: String = ""
     @Published var busy = false
     @Published var connectionIssue: String?
     @Published var lastReport: SyncReport?
     @Published private(set) var lastSuccessfulSyncAt: Date?
+    @Published private(set) var lastInsertedCount: UInt32?
     /// Serial of the ring this phone last talked to — used to confirm a factory reset
     /// targets THIS ring and not one that merely won the scan.
     @Published private(set) var knownSerial: String? = UserDefaults.standard.string(forKey: "ring.serial")
 
     /// A launch/foreground refresh is useful, but reconnecting twice while someone
     /// briefly switches apps is not. Manual sync remains available at any time.
-    static let automaticSyncCooldown: TimeInterval = 3 * 60
+    static let automaticSyncCooldown: TimeInterval = 5 * 60
     private static let lastSuccessfulSyncKey = "ring.last-successful-sync-at"
+    private static let lastInsertedCountKey = "ring.last-inserted-count"
     // Set the moment a drain reports real progress, cleared only on a completed
     // sync — so it survives an app kill mid-drain and distinguishes "interrupted
     // with data on the ring" (resume eagerly) from "never reached the ring".
@@ -362,7 +403,7 @@ final class RingSync: ObservableObject {
         for name in [UIApplication.didEnterBackgroundNotification, UIApplication.protectedDataWillBecomeUnavailableNotification] {
             lifecycleObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor in
-                    guard let self, self.busy else { return }
+                    guard let self, self.busy, !WorkCoordinator.shared.allowBackgroundWork else { return }
                     WorkCoordinator.shared.beginCleanup()
                     self.pause()
                 }
@@ -370,6 +411,14 @@ final class RingSync: ObservableObject {
         }
         let timestamp = UserDefaults.standard.double(forKey: Self.lastSuccessfulSyncKey)
         lastSuccessfulSyncAt = timestamp > 0 ? Date(timeIntervalSince1970: timestamp) : nil
+        if lastSuccessfulSyncAt != nil,
+           let saved = UserDefaults.standard.object(forKey: Self.lastInsertedCountKey) as? Int {
+            lastInsertedCount = UInt32(exactly: saved)
+        }
+        if CommandLine.arguments.contains("-previewRing") {
+            lastSuccessfulSyncAt = Date()
+            lastInsertedCount = 167
+        }
     }
 
     var wasRecentlySynced: Bool {
@@ -400,26 +449,51 @@ final class RingSync: ObservableObject {
                          source: resuming ? "resume" : "automatic")
     }
 
-    func resetLocalDatabase() async -> Bool {
+    /// Remove every saved ring value on this iPhone. This does not send a command
+    /// to the ring, so its on-device history and pairing state stay intact.
+    func deleteAllLocalData() async -> Bool {
         pause()
         WorkCoordinator.shared.invalidateAnalysis()
         await WorkGate.shared.acquire()
         defer { Task { await WorkGate.shared.release() } }
-        guard WorkCoordinator.shared.available else { return false }
+        guard WorkCoordinator.shared.available else {
+            status = "Open Oring to delete local data."
+            return false
+        }
         do {
             try DB.resetWritableStore()
-            lastReport = nil; lastSuccessfulSyncAt = nil
-            UserDefaults.standard.removeObject(forKey: Self.lastSuccessfulSyncKey)
-            clearIncompleteSync()
+            let profile = DB.url.deletingLastPathComponent().appendingPathComponent("profile.json")
+            if FileManager.default.fileExists(atPath: profile.path) {
+                try FileManager.default.removeItem(at: profile)
+            }
             SummaryCache.clear()
             #if TORCH
             ModelCacheStore.clearAll()
             #endif
+            try DiagStore.shared.clearStoredData()
+            RingDiag.shared.clear()
+            let temp = FileManager.default.temporaryDirectory
+            for file in try FileManager.default.contentsOfDirectory(at: temp, includingPropertiesForKeys: nil)
+            where file.lastPathComponent.hasPrefix("oura-") || file.lastPathComponent == "restore-candidate.db" {
+                try FileManager.default.removeItem(at: file)
+            }
+            Keychain.clearKey()
+            BackgroundSync.shared.cancel()
+            for name in [Self.lastSuccessfulSyncKey, Self.lastInsertedCountKey,
+                         Self.syncIncompleteKey, "ring.serial"] {
+                UserDefaults.standard.removeObject(forKey: name)
+            }
+            knownSerial = nil
+            lastReport = nil; lastSuccessfulSyncAt = nil; lastInsertedCount = nil
+            lastAutomaticAttemptAt = nil
             connectionIssue = nil
-            status = "local sync data reset"
-            dlog("db", status)
+            status = "Local data deleted."
             return true
-        } catch { status = "reset failed: \(error)"; dlog("db", status); return false }
+        } catch {
+            status = "Could not delete all local data: \(error.localizedDescription)"
+            dlog("db", status)
+            return false
+        }
     }
 
     func checkDatabase() async {
@@ -428,10 +502,7 @@ final class RingSync: ObservableObject {
         guard WorkCoordinator.shared.available else { return }
         connectionIssue = nil
         let path = DB.readPath()
-        status = await Task.detached {
-            do { return "Database check: \(try databaseIntegrity(dbPath: path))" }
-            catch { return "Database check failed: \(error)" }
-        }.value
+        status = await Task.detached { DB.integrityMessage(path: path) }.value
         dlog("db", status)
     }
 
@@ -473,7 +544,16 @@ final class RingSync: ObservableObject {
     /// Only proceeds when the ring that answers reports `confirmSerial`, so this cannot
     /// wipe someone else's ring sitting on the same charger.
     func factoryReset(keyHex: String, confirmSerial: String) async -> Bool {
-        guard !busy else { return false }
+        if busy {
+            pause()
+            for _ in 0..<100 where busy {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            guard !busy else {
+                status = "The current sync is still stopping. Try the reset again."
+                return false
+            }
+        }
         guard WorkCoordinator.shared.available else { status = "paused — open the app to reset"; return false }
         connectionIssue = nil
         busy = true
@@ -515,8 +595,12 @@ final class RingSync: ObservableObject {
         status = "erasing…"
         do {
             let serial = try await s.factoryReset(keyHex: keyHex, confirmSerial: confirmSerial)
+            do { try DB.resetSyncCursor(for: serial) }
+            catch { dlog("reset", "ring wiped; local sync cursor reset failed: \(error)") }
             Keychain.clearKey()
-            lastReport = nil
+            lastReport = nil; lastSuccessfulSyncAt = nil; lastInsertedCount = nil
+            UserDefaults.standard.removeObject(forKey: Self.lastSuccessfulSyncKey)
+            UserDefaults.standard.removeObject(forKey: Self.lastInsertedCountKey)
             dlog("reset", "wiped \(serial)")
             status = "\(serial) wiped. Its old key is gone — pair it again to start over."
             return true
@@ -563,7 +647,10 @@ final class RingSync: ObservableObject {
             try await t.connect()
         } catch {
             dlog("pair", "BLE connect FAILED: \(error)")
-            if case BLEError.poweredOff = error {
+            if case BLEError.staleBond = error {
+                connectionIssue = "Old Bluetooth pairing"
+                status = "Open iPhone Settings → Bluetooth. If your Oura ring appears under My Devices, tap ⓘ, then Forget This Device. Return here and try again. This does not erase ring data."
+            } else if case BLEError.poweredOff = error {
                 status = "Bluetooth unavailable — check power and permission in Settings"
             } else {
                 status = "couldn't connect (\(error)) — put the reset ring on its charger next to this iPhone"
@@ -585,6 +672,7 @@ final class RingSync: ObservableObject {
             // Persist BEFORE anything else can fail: the ring now holds this key and
             // will not hand it back.
             Keychain.saveKey(report.keyHex)
+            BackgroundSync.shared.schedule()
             rememberSerial(report.serial)
             dlog("pair", "paired \(report.serial) minted=\(report.minted)")
             status = "paired with \(report.serial) — key saved to this iPhone. Back it up: it can't be read off the ring."
@@ -667,6 +755,11 @@ final class RingSync: ObservableObject {
                 // app holds it, leaving nothing to discover.
                 if case BLEError.poweredOff = error { status = "Bluetooth is unavailable. Check Bluetooth and app permissions in Settings."; return nil }
                 t.disconnect()
+                if case BLEError.staleBond = error {
+                    connectionIssue = "Old Bluetooth pairing"
+                    status = "Open iPhone Settings → Bluetooth. If your Oura ring appears under My Devices, tap ⓘ, then Forget This Device. Return here and try again. This does not erase ring data."
+                    return nil
+                }
                 if case BLEError.ringNotAdvertising(let count) = error, !connectedDuringRun {
                     connectionIssue = "Your ring wasn’t found"
                     status = count > 0
@@ -706,10 +799,12 @@ final class RingSync: ObservableObject {
                 Keychain.saveKey(key)
                 rememberSerial(report.serial)
                 lastReport = report
+                lastInsertedCount = report.inserted
                 let completedAt = Date()
                 lastSuccessfulSyncAt = completedAt
                 UserDefaults.standard.set(completedAt.timeIntervalSince1970,
                                           forKey: Self.lastSuccessfulSyncKey)
+                UserDefaults.standard.set(Int(report.inserted), forKey: Self.lastInsertedCountKey)
                 clearIncompleteSync()
                 dlog("sync", "OK run=\(runID) inserted=\(report.inserted) events=\(report.eventsSynced) cursor=\(report.nextCursor)")
                 status = "Sync complete."

@@ -36,7 +36,11 @@ final class AnalysisRun: @unchecked Sendable {
 @MainActor
 final class WorkCoordinator {
     static let shared = WorkCoordinator()
-    var available: Bool { UIApplication.shared.applicationState == .active && UIApplication.shared.isProtectedDataAvailable }
+    var allowBackgroundWork = false
+    var available: Bool {
+        UIApplication.shared.isProtectedDataAvailable &&
+            (UIApplication.shared.applicationState == .active || allowBackgroundWork)
+    }
     private var analysis: AnalysisRun?
     private var observers: [NSObjectProtocol] = []
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid

@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import Combine
 
 // The SwiftUI screens for OuraApp. Data types live in Models.swift, the model/FFI
 // orchestration in Core.swift, the reusable charts/cells in Components.swift, and the
@@ -100,7 +101,7 @@ struct AllDaysView: View {
         let s = analysis?.summary ?? s
         NavigationStack {
             ZStack {
-                Obs.canvas.ignoresSafeArea()
+                SpaceBackdrop()
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
                         ForEach(groups(s.days), id: \.title) { group in
@@ -166,20 +167,33 @@ struct AllDaysView: View {
 // Pair + sync from a real ring: paste the auth key (exported on the desktop), connect
 // over BLE, drain history into the writable DB. BLE only works on a physical device.
 struct SyncView: View {
-    @ScaledMetric(relativeTo: .title) private var pairingTitleSize: CGFloat = 28
+    private enum SetupStep { case ready, method, key, newRing, syncing }
+    private enum ResetAlert {
+        case deleteLocalData, factoryReset, notice(String, String)
+    }
+    @ScaledMetric(relativeTo: .largeTitle) private var stepTitleSize: CGFloat = 34
     @ObservedObject var ring: RingSync
+    let device: Device?
     let onSynced: (SyncReport) -> Void
     let onReset: () -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var key = Keychain.loadKey() ?? ""
+    @State private var step: SetupStep = CommandLine.arguments.contains("-previewRing")
+        ? .syncing : (CommandLine.arguments.contains("-simulateStaleBond")
+        ? .newRing : (Keychain.loadKey() == nil ? .ready : .syncing))
+    @State private var justPaired = false
     @ObservedObject private var diag = RingDiag.shared
     @ObservedObject private var store = DiagStore.shared
     @State private var diagnosticFile: URL?
     @State private var showKey = false
+    @State private var keySettingsMessage: String?
     @State private var clockReport: String?
-    @State private var confirmReset = false
-    @State private var confirmWipeRing = false
+    @State private var resetAlert: ResetAlert?
     @State private var showRestorePicker = false
+    @State private var showSyncSuccess = false
+    @State private var showSyncError = false
+    @State private var successGeneration = 0
+    @State private var didForceSync = false
     @State private var restoreNote: String?
     @FocusState private var keyFocused: Bool
 
@@ -220,27 +234,58 @@ struct SyncView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    header
-                    if ring.connectionIssue != nil { syncStatus }
-                    else { preparation }
-                    if !ring.busy { pairingKey }
-                    connection
-                    support
-                    BuildStamp()
+            ZStack {
+                SpaceBackdrop()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        if step != .syncing {
+                            Text(stepNumber)
+                                .font(.caption.weight(.semibold))
+                                .tracking(1.3)
+                                .foregroundStyle(Obs.link)
+                            Text(stepTitle)
+                                .font(.system(size: stepTitleSize, weight: .bold))
+                                .foregroundStyle(Obs.ink)
+                                .padding(.top, 14)
+                        }
+                        Text(stepDetail)
+                            .font(.body)
+                            .foregroundStyle(Obs.ink2)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, step == .syncing ? 0 : 12)
+                        stepContent
+                            .padding(.top, step == .syncing ? 16 : 34)
+                        Spacer(minLength: 45)
+                        if step != .syncing {
+                            NavigationLink {
+                                advancedSupport
+                            } label: {
+                                Label("Advanced & diagnostics", systemImage: "slider.horizontal.3")
+                                    .font(.footnote)
+                                    .foregroundStyle(Obs.muted)
+                                    .frame(minHeight: 44)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .frame(maxWidth: 520, minHeight: 560, alignment: .topLeading)
+                    .padding(.horizontal, 28)
+                    .padding(.top, step == .syncing ? 28 : 48)
+                    .padding(.bottom, 24)
+                    .frame(maxWidth: .infinity)
                 }
-                .frame(maxWidth: 520)
-                .padding(.horizontal, 24)
-                .padding(.top, 20)
-                .padding(.bottom, 32)
-                .frame(maxWidth: .infinity)
+                .scrollDismissesKeyboard(.interactively)
             }
-            .scrollDismissesKeyboard(.interactively)
-            .background(Obs.paper)
-            .navigationTitle("Your ring")
+            .navigationTitle(step == .syncing ? "Your ring" : "Connect your ring")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    if step != .ready && step != .syncing {
+                        Button("Back", systemImage: "chevron.left") {
+                            step = step == .method ? .ready : .method
+                        }.labelStyle(.iconOnly)
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }
                         .foregroundStyle(Obs.ink)
@@ -250,31 +295,33 @@ struct SyncView: View {
                     Button("Done") { keyFocused = false }
                 }
             }
-            .alert("Reset local sync data?", isPresented: $confirmReset) {
-                Button("Cancel", role: .cancel) {}
-                Button("Reset local data", role: .destructive) {
-                    Task { if await ring.resetLocalDatabase() { onReset() } }
-                }
+            .alert(ring.connectionIssue ?? "Connection issue", isPresented: $showSyncError) {
+                Button("OK", role: .cancel) {}
             } message: {
-                Text("This removes the synced data on this iPhone. Your next sync will download the history still available on your ring.")
-            }
-            .alert("Factory-reset \(ring.knownSerial ?? "the ring")?", isPresented: $confirmWipeRing) {
-                Button("Cancel", role: .cancel) {}
-                Button("Erase the ring", role: .destructive) {
-                    let serial = ring.knownSerial ?? ""
-                    let current = key
-                    Task {
-                        if await ring.factoryReset(keyHex: current, confirmSerial: serial) {
-                            key = ""
-                            showKey = false
-                        }
-                    }
-                }
-            } message: {
-                Text("Erases the ring's pairing key, its Bluetooth bonds, any events it hasn't sent yet, and your stored body profile. Sync first if you want those events. This cannot be undone — but the ring stays yours: pair it again right here afterwards.")
+                Text(ring.status)
             }
         }
-        .tint(Obs.ink)
+        .tint(Obs.link)
+        .onAppear {
+            if !didForceSync && CommandLine.arguments.contains("-forceSyncOnLaunch") {
+                didForceSync = true
+                startSync()
+            }
+        }
+        .onChange(of: ring.connectionIssue) { _, issue in
+            if step == .syncing && issue != nil { showSyncError = true }
+        }
+        .onChange(of: ring.lastSuccessfulSyncAt) { old, new in
+            guard step == .syncing, new != nil, old != new else { return }
+            successGeneration += 1
+            let generation = successGeneration
+            withAnimation(.easeOut(duration: 0.4)) { showSyncSuccess = true }
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(1.5))
+                guard successGeneration == generation else { return }
+                withAnimation(.easeOut(duration: 0.6)) { showSyncSuccess = false }
+            }
+        }
         // Sync belongs to RingSync and continues when this panel is dismissed.
         .sheet(isPresented: Binding(get: { diagnosticFile != nil }, set: { if !$0 { diagnosticFile = nil } })) {
             if let diagnosticFile { DiagnosticsShare(url: diagnosticFile) }
@@ -288,36 +335,375 @@ struct SyncView: View {
         .presentationDragIndicator(.visible)
     }
 
-    private var header: some View {
-        Text("Pair your ring")
-            .font(Obs.serif(pairingTitleSize))
-            .foregroundStyle(Obs.ink)
-    }
-
-    private var preparation: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            setupRow(icon: "bolt", title: "Put the ring on its charger, next to this iPhone", detail: nil)
-            setupRow(icon: "antenna.radiowaves.left.and.right", title: "Free the Bluetooth link",
-                     detail: "Turn Bluetooth off on other phones running the Oura app.")
+    private var stepNumber: String {
+        switch step {
+        case .ready: return "01 / GET READY"
+        case .method: return "02 / YOUR RING"
+        case .key, .newRing: return "03 / CONNECT"
+        case .syncing: return "YOUR RING"
         }
     }
 
-    private func setupRow(icon: String, title: String, detail: String?) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
-            Image(systemName: icon)
-                .font(.system(size: 15, weight: .regular))
-                .foregroundStyle(Obs.muted)
-                .frame(width: 20)
+    private var stepTitle: String {
+        switch step {
+        case .ready: return "Bring your ring close."
+        case .method: return "How was it paired?"
+        case .key: return "Enter your pairing key."
+        case .newRing: return "Pair a fresh ring."
+        case .syncing: return "Your ring."
+        }
+    }
+
+    private var stepDetail: String {
+        switch step {
+        case .ready: return "Place it on its charger beside this iPhone. If another phone is connected to your ring, turn Bluetooth off on that phone for now."
+        case .method: return "A previously paired ring uses its existing 32-character key. A ring that has already been factory reset can make a new key here."
+        case .key: return justPaired ? "Your new key is saved on this iPhone. Keep a separate copy before you sync." : "Paste the key from your existing ring backup to connect directly over Bluetooth."
+        case .newRing: return "Only continue if your ring is already factory reset. Resetting a ring erases any sleep data it has not sent yet."
+        case .syncing: return "Checks when you open Oring and every 5 minutes while it’s active. Background checks run when your iPhone allows."
+        }
+    }
+
+    @ViewBuilder private var stepContent: some View {
+        switch step {
+        case .ready:
+            Image("RingHero")
+                .resizable().scaledToFit()
+                .frame(maxWidth: .infinity).frame(height: 240)
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.subheadline.weight(.medium)).foregroundStyle(Obs.ink)
-                    .fixedSize(horizontal: false, vertical: true)
-                if let detail {
-                    Text(detail).font(.footnote).foregroundStyle(Obs.ink2)
+            primaryButton("My ring is ready") { step = .method }
+                .padding(.top, 32)
+        case .method:
+            VStack(spacing: 14) {
+                choice("I have a pairing key", icon: "key.horizontal", detail: "Use a ring already paired elsewhere") { step = .key }
+                choice("My ring was factory reset", icon: "sparkle", detail: "Create a new key on this iPhone") { step = .newRing }
+            }
+        case .key:
+            pairingKey
+            if justPaired {
+                Button {
+                    UIPasteboard.general.string = key
+                } label: {
+                    Label("Copy key for backup", systemImage: "doc.on.doc")
+                        .font(.subheadline.weight(.medium))
+                        .frame(minHeight: 44)
+                }
+                .padding(.top, 12)
+            }
+            primaryButton("Connect & sync", enabled: validKey && !ring.busy) { startSync() }
+                .padding(.top, 28)
+            Text("The first sync can take several minutes.")
+                .font(.footnote).foregroundStyle(Obs.muted)
+                .padding(.top, 14)
+        case .newRing:
+            Image("RingHero")
+                .resizable().scaledToFit()
+                .frame(maxWidth: .infinity).frame(height: 235)
+                .accessibilityHidden(true)
+            if ring.busy { syncStatus }
+            primaryButton("Create a pairing key", enabled: !ring.busy) {
+                Task {
+                    if let minted = await ring.pair() {
+                        key = minted
+                        justPaired = true
+                        step = .key
+                    }
+                }
+            }.padding(.top, 24)
+            if let issue = ring.connectionIssue {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(issue).font(.headline).foregroundStyle(Obs.bad)
+                    Text(ring.status).font(.footnote).foregroundStyle(Obs.ink2)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Obs.rule.opacity(0.65), in: RoundedRectangle(cornerRadius: 16))
+                .padding(.top, 18)
             }
+        case .syncing:
+            RingSyncVisual(battery: CommandLine.arguments.contains("-previewRing") ? 78 : device?.battery_pct)
+            syncAction
+                .padding(.top, 34)
+            NavigationLink { ringSettings } label: {
+                HStack {
+                    Text("Ring settings")
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                }
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(Obs.link)
+                .frame(minHeight: 50)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.top, 12)
         }
+    }
+
+    private var lastCheckedLine: String {
+        guard let last = ring.lastSuccessfulSyncAt else { return "Ready to check your ring" }
+        let elapsed = Date().timeIntervalSince(last)
+        let when = elapsed < 60 ? "now" : RelativeDateTimeFormatter().localizedString(for: last, relativeTo: Date())
+        if let count = ring.lastInsertedCount { return "Last checked \(when) · \(count) new events" }
+        return "Last checked \(when)"
+    }
+
+    private var syncAction: some View {
+        Button { if !ring.busy && validKey { startSync() } } label: {
+            HStack(spacing: 14) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(ring.busy ? "Syncing…" : (showSyncSuccess ? "Synced" : (ring.connectionIssue == nil ? "Sync now" : "Try again")))
+                        .font(.body.weight(.semibold))
+                    Text(ring.busy ? "Listening to your ring" : (showSyncSuccess ? "Last checked now" : lastCheckedLine))
+                        .font(.footnote)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+                Spacer(minLength: 0)
+                Group {
+                    if ring.busy { ProgressView().tint(Obs.paper) }
+                    else { Image(systemName: showSyncSuccess ? "checkmark" : "arrow.right") }
+                }
+                .font(.system(size: 19, weight: .semibold))
+                .frame(width: 24, height: 24)
+            }
+            .foregroundStyle(Obs.paper)
+            .padding(.horizontal, 20)
+            .frame(maxWidth: .infinity)
+            .frame(height: 82)
+            .background(showSyncSuccess ? Obs.good : Obs.ink,
+                        in: RoundedRectangle(cornerRadius: 18))
+            .shadow(color: Obs.good.opacity(showSyncSuccess ? 0.24 : 0), radius: 18)
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint(ring.busy ? "Sync in progress" : "Checks the ring for new data")
+    }
+
+    private var ringSettings: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                Text("Your ring, your way.")
+                    .font(.system(.title2, weight: .semibold))
+                    .foregroundStyle(Obs.ink)
+                Text("See what the ring last sent, manage its key, or open technical tools when you need them.")
+                    .font(.body).foregroundStyle(Obs.ink2)
+                VStack(spacing: 0) {
+                    NavigationLink { ringDetails } label: {
+                        SupportRowLabel(icon: "circle.hexagongrid", title: "Ring details",
+                                        detail: "Battery, firmware and last sync", trailing: "chevron.right")
+                    }
+                    .buttonStyle(.plain)
+                    SupportDivider()
+                    NavigationLink {
+                        pairingKeySettings
+                    } label: {
+                        SupportRowLabel(icon: "key.horizontal", title: "Pairing key",
+                                        detail: "View or change the saved key", trailing: "chevron.right")
+                    }
+                    .buttonStyle(.plain)
+                    SupportDivider()
+                    NavigationLink { advancedSupport } label: {
+                        SupportRowLabel(icon: "slider.horizontal.3", title: "Advanced & diagnostics",
+                                        detail: "Raw data, backups and reports", trailing: "chevron.right")
+                    }
+                    .buttonStyle(.plain)
+                }
+                .background(Obs.rule.opacity(0.4), in: RoundedRectangle(cornerRadius: 20))
+            }
+            .padding(24)
+            .frame(maxWidth: 520)
+            .frame(maxWidth: .infinity)
+        }
+        .background(Obs.paper)
+        .navigationTitle("Ring settings")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private var advancedSupport: some View {
+        ScrollView { support.padding(24) }
+            .background(Obs.paper)
+            .navigationTitle("Advanced & diagnostics")
+            .navigationBarTitleDisplayMode(.inline)
+            .alert(resetAlertTitle, isPresented: Binding(
+                get: { resetAlert != nil },
+                set: { if !$0 { resetAlert = nil } }
+            )) {
+                switch resetAlert {
+                case .deleteLocalData:
+                    Button("Cancel", role: .cancel) {}
+                    Button("Delete data", role: .destructive) {
+                        Task {
+                            if await ring.deleteAllLocalData() {
+                                key = ""
+                                step = .ready
+                                dismiss()
+                                onReset()
+                            } else {
+                                resetAlert = .notice("Could not delete data", ring.status)
+                            }
+                        }
+                    }
+                case .factoryReset:
+                    Button("Cancel", role: .cancel) {}
+                    Button("Erase the ring", role: .destructive) {
+                        let serial = ring.knownSerial ?? ""
+                        let current = key
+                        Task {
+                            if await ring.factoryReset(keyHex: current, confirmSerial: serial) {
+                                key = ""
+                                showKey = false
+                                step = .ready
+                                dismiss()
+                            } else {
+                                resetAlert = .notice("Could not reset ring", ring.status)
+                            }
+                        }
+                    }
+                case .notice, .none:
+                    Button("OK", role: .cancel) {}
+                }
+            } message: {
+                Text(resetAlertMessage)
+            }
+    }
+
+    private var resetAlertTitle: String {
+        switch resetAlert {
+        case .deleteLocalData: "Delete all local data?"
+        case .factoryReset: "Factory-reset \(ring.knownSerial ?? "the ring")?"
+        case .notice(let title, _): title
+        case .none: ""
+        }
+    }
+
+    private var resetAlertMessage: String {
+        switch resetAlert {
+        case .deleteLocalData:
+            "Removes this iPhone’s ring history, profile, pairing key and diagnostics. Your ring is not erased."
+        case .factoryReset:
+            "Erases the ring's pairing key, Bluetooth bonds, unsynced events and stored body profile. Pair it again afterwards."
+        case .notice(_, let message): message
+        case .none: ""
+        }
+    }
+
+    private var ringDetails: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 28) {
+                Text("The latest information your ring sent to this iPhone.")
+                    .font(.body).foregroundStyle(Obs.ink2)
+                VStack(spacing: 17) {
+                    ObsStat(label: "Ring", value: device?.serial ?? ring.knownSerial ?? "Not identified yet")
+                    ObsStat(label: "Battery", value: device?.battery_pct.map { "\($0)%" } ?? "Available after sync")
+                    ObsStat(label: "Firmware", value: device?.firmware ?? "Available after sync")
+                    ObsStat(label: "Last sync", value: ring.lastSuccessfulSyncAt.map {
+                        $0.formatted(date: .abbreviated, time: .shortened)
+                    } ?? "Not yet")
+                    if let count = ring.lastInsertedCount {
+                        ObsStat(label: "New events last sync", value: "\(count)")
+                    }
+                }
+                .padding(20)
+                .background(Obs.rule.opacity(0.45), in: RoundedRectangle(cornerRadius: 20))
+            }
+            .padding(24)
+            .frame(maxWidth: 520)
+            .frame(maxWidth: .infinity)
+        }
+        .background(Obs.paper)
+        .navigationTitle("Ring details")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private var pairingKeySettings: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                Text("The key this iPhone uses to talk to your ring. Paste a different key only if you paired this ring elsewhere.")
+                    .font(.body).foregroundStyle(Obs.ink2)
+                pairingKey
+                Button {
+                    guard validKey, !ring.busy else { return }
+                    let saved = key.trimmingCharacters(in: .whitespacesAndNewlines)
+                    Keychain.saveKey(saved)
+                    keySettingsMessage = Keychain.loadKey() == saved
+                        ? "Pairing key saved on this iPhone."
+                        : "Could not save the pairing key. Try again."
+                } label: {
+                    HStack {
+                        Text("Save pairing key")
+                        Spacer()
+                        Image(systemName: "checkmark")
+                    }
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(Obs.paper)
+                    .padding(.horizontal, 20)
+                    .frame(maxWidth: .infinity, minHeight: 58)
+                    .background(Obs.ink, in: RoundedRectangle(cornerRadius: 18))
+                }
+                .buttonStyle(.plain)
+                .disabled(!validKey || ring.busy)
+                .opacity(validKey && !ring.busy ? 1 : 0.4)
+                if let keySettingsMessage {
+                    Text(keySettingsMessage)
+                        .font(.footnote)
+                        .foregroundStyle(keySettingsMessage.hasPrefix("Could not") ? Obs.bad : Obs.good)
+                }
+                if ring.busy {
+                    Text("Wait for the current sync to finish before changing the key.")
+                        .font(.footnote).foregroundStyle(Obs.ink2)
+                }
+            }
+            .padding(24)
+            .frame(maxWidth: 520)
+            .frame(maxWidth: .infinity)
+        }
+        .background(Obs.paper)
+        .navigationTitle("Pairing key")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func startSync() {
+        keyFocused = false
+        step = .syncing
+        Task { if let report = await ring.run(keyHex: key) { onSynced(report) } }
+    }
+
+    private func primaryButton(_ title: String, enabled: Bool = true, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack {
+                Text(title)
+                Spacer()
+                Image(systemName: "arrow.right")
+            }
+            .font(.body.weight(.semibold))
+            .foregroundStyle(Obs.paper)
+            .padding(.horizontal, 20)
+            .frame(maxWidth: .infinity, minHeight: 58)
+            .background(Obs.ink, in: RoundedRectangle(cornerRadius: 18))
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.4)
+    }
+
+    private func choice(_ title: String, icon: String, detail: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 18) {
+                Image(systemName: icon).font(.title3).frame(width: 30)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(title).font(.body.weight(.semibold))
+                    Text(detail).font(.footnote).foregroundStyle(Obs.ink2)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right").font(.caption.weight(.semibold))
+            }
+            .foregroundStyle(Obs.ink)
+            .padding(18)
+            .frame(maxWidth: .infinity, minHeight: 86)
+            .background(Obs.rule.opacity(0.55), in: RoundedRectangle(cornerRadius: 20))
+        }
+        .buttonStyle(.plain)
     }
 
     private var pairingKey: some View {
@@ -356,33 +742,16 @@ struct SyncView: View {
                     .foregroundStyle(Obs.ink2)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            pairReset
-        }
-    }
-
-    /// Adopt a factory-reset ring without a computer: mint the key on this iPhone.
-    private var pairReset: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Button {
-                keyFocused = false
-                Task { if let minted = await ring.pair() { key = minted } }
-            } label: {
-                (Text("No key? ").foregroundStyle(Obs.ink2)
-                 + Text("Pair a factory-reset ring").foregroundStyle(Obs.ink).underline())
-                    .font(.footnote)
-            }
-            .buttonStyle(.plain)
-            .disabled(ring.busy)
-            Text("Write the new key down: it cannot be read back from the ring.")
-                .font(.footnote)
-                .foregroundStyle(Obs.muted)
-                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
     @ViewBuilder
     private var syncStatus: some View {
-        if ring.busy || !ring.status.isEmpty {
+        if ring.lastReport != nil && !ring.busy && ring.connectionIssue == nil {
+            Label("Up to date", systemImage: "checkmark.circle")
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(Obs.good)
+        } else if ring.busy || ring.connectionIssue != nil {
             HStack(alignment: .top, spacing: 12) {
                 if ring.busy {
                     ProgressView().tint(Obs.ink).frame(width: 24, height: 24)
@@ -410,42 +779,6 @@ struct SyncView: View {
         }
     }
 
-    private var connection: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            if ring.connectionIssue == nil { syncStatus }
-            if ring.busy {
-                Button { ring.pause() } label: {
-                    Label("Pause sync", systemImage: "pause")
-                        .font(.body.weight(.medium))
-                        .frame(maxWidth: .infinity, minHeight: 52)
-                        .foregroundStyle(Obs.ink)
-                        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Obs.rule))
-                }
-                .buttonStyle(.plain)
-            } else {
-                Button {
-                    keyFocused = false
-                    Task {
-                        if let report = await ring.run(keyHex: key) { onSynced(report) }
-                    }
-                } label: {
-                    HStack(spacing: 10) {
-                        Text("Connect & sync")
-                        Image(systemName: "arrow.right")
-                    }
-                    .font(.body.weight(.semibold))
-                    .frame(maxWidth: .infinity, minHeight: 54)
-                    .foregroundStyle(validKey ? Obs.paper : Obs.muted)
-                    .background(validKey ? Obs.ink : Obs.rule, in: RoundedRectangle(cornerRadius: 14))
-                }
-                .buttonStyle(.plain)
-                .disabled(!validKey)
-                Text("Your first sync may take a few minutes.")
-                    .font(.footnote).foregroundStyle(Obs.ink2)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
 
     // Help & diagnostics: one quiet card of grouped rows instead of nested disclosures.
     // Everyday actions first, the technical transcript one tap deeper, destructive last.
@@ -495,16 +828,21 @@ struct SyncView: View {
             .background(Obs.rule.opacity(0.3), in: RoundedRectangle(cornerRadius: 16))
 
             VStack(spacing: 0) {
-                SupportRow(icon: "trash", title: "Reset local sync data",
-                           detail: "The next sync fetches it again",
-                           tint: Obs.alert, disabled: ring.busy) { confirmReset = true }
+                SupportRow(icon: "trash", title: "Delete all local data",
+                           detail: "History, profile, key and diagnostics on this iPhone",
+                           tint: Obs.alert) { resetAlert = .deleteLocalData }
                 SupportDivider()
                 SupportRow(icon: "exclamationmark.triangle", title: "Factory-reset the ring",
-                           detail: ring.knownSerial == nil
-                               ? "Available after the first sync"
-                               : "Wipes the ring. Pair it again afterwards",
-                           tint: Obs.alert,
-                           disabled: ring.busy || ring.knownSerial == nil || !validKey) { confirmWipeRing = true }
+                           detail: "Erases the ring itself. Pair it again afterwards",
+                           tint: Obs.alert) {
+                    if ring.knownSerial == nil {
+                        resetAlert = .notice("Reset unavailable", "Sync this ring once so Oring can identify it before erasing it.")
+                    } else if !validKey {
+                        resetAlert = .notice("Reset unavailable", "Enter this ring’s pairing key in Ring settings first.")
+                    } else {
+                        resetAlert = .factoryReset
+                    }
+                }
             }
             .background(Obs.alert.opacity(0.06), in: RoundedRectangle(cornerRadius: 16))
             .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Obs.alert.opacity(0.18)))
@@ -764,6 +1102,7 @@ private struct SyncIndicatorButton: View {
                     .rotationEffect(.degrees(rotation))
             }
             .frame(width: 31, height: 31)
+            .frame(width: 44, height: 44)
         }
         .buttonStyle(.plain)
         .accessibilityLabel(ring.busy ? "Ring sync in progress" : "Ring sync and diagnostics")
@@ -796,6 +1135,25 @@ struct RootView: View {
     private func applyLaunchArguments() {
         let args = CommandLine.arguments
         if args.contains("-openSync") { showSync = true }
+        if args.contains("-previewRing") {
+            var preview = Summary()
+            preview.device = Device(serial: "SAMPLE", firmware: nil, battery_pct: 78,
+                                    days_of_data: nil, nights: nil, synced: nil, synced_hm: nil)
+            s = preview
+            showSync = true
+        }
+        if args.contains("-openProfile") { showProfile = true }
+        if args.contains("-previewConnectedEmpty") {
+            var preview = Summary()
+            preview.device = Device(serial: nil, firmware: nil, battery_pct: nil,
+                                    days_of_data: nil, nights: nil, synced: nil, synced_hm: nil)
+            s = preview
+        }
+        if args.contains("-simulateStaleBond") {
+            ring.connectionIssue = "Old Bluetooth pairing"
+            ring.status = "Open iPhone Settings → Bluetooth. If your Oura ring appears under My Devices, tap ⓘ, then Forget This Device. Return here and try again. This does not erase ring data."
+            showSync = true
+        }
         if args.contains("-openSample") { showSample = true }
         if args.contains("-openAllDays") { showAllDays = true }
         if let index = args.firstIndex(of: "-openDay"), index + 1 < args.count {
@@ -807,10 +1165,11 @@ struct RootView: View {
     @State private var showSync = false
     @State private var showProfile = false
     @State private var showSleepDebt = false
+    @State private var showMoreInsights = false
     @State private var vital: VitalKind?
     @State private var loadGeneration = 0
     @State private var isRefreshingSummary = false
-    @StateObject private var ring = RingSync()
+    @StateObject private var ring = RingSync.shared
     @StateObject private var modelProgress = ModelProgress()
     private func f(_ v: Double?, _ fallback: String = "–") -> String {
         v.map { "\(Int($0))" } ?? fallback
@@ -839,7 +1198,7 @@ struct RootView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                Obs.canvas.ignoresSafeArea()
+                SpaceBackdrop()
                 if let s {
                     content(s)
                 } else {
@@ -862,7 +1221,7 @@ struct RootView: View {
         .sheet(isPresented: $showAllDays) { if let s { AllDaysView(s: s) } }
         .onAppear(perform: applyLaunchArguments)
         .sheet(isPresented: $showSync) {
-            SyncView(ring: ring, onSynced: refreshAfterSync, onReset: resetAndReload)
+            SyncView(ring: ring, device: s?.device, onSynced: refreshAfterSync, onReset: resetAndReload)
         }
         .sheet(isPresented: $showProfile) { ProfileSettingsView(profile: s?.profile, onSaved: refreshDerivedData) }
         .sheet(isPresented: $showSleepDebt) { if let debt = s?.sleepDebt { SleepDebtDetail(debt: debt) } }
@@ -875,6 +1234,10 @@ struct RootView: View {
             // A cached summary makes launch immediate; this forced load replaces it
             // with SQLite + model output without blanking the existing Today card.
             requestAutomaticSync()
+            BackgroundSync.shared.schedule()
+        }
+        .onReceive(Timer.publish(every: 5 * 60, on: .main, in: .common).autoconnect()) { _ in
+            if scenePhase == .active { requestAutomaticSync() }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.protectedDataDidBecomeAvailableNotification)) { _ in
             requestAutomaticSync()
@@ -884,6 +1247,7 @@ struct RootView: View {
                 requestAutomaticSync()
             } else if phase == .background {
                 WorkCoordinator.shared.invalidateAnalysis()
+                BackgroundSync.shared.schedule()
             }
         }
     }
@@ -917,7 +1281,8 @@ struct RootView: View {
     }
 
     private func requestAutomaticSync() {
-        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
+        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil,
+              !CommandLine.arguments.contains("-previewConnectedEmpty") else { return }
         Task {
             _ = await ring.syncAutomaticallyIfNeeded()
             if WorkCoordinator.shared.available { load(force: true, clearCurrent: false) }
@@ -1023,16 +1388,17 @@ struct RootView: View {
 
     @ViewBuilder private func ringWelcome(error: String?) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("Your nights,\nunlocked.")
-                .font(Obs.serif(welcomeTitleSize))
+            Text("A clearer view\nof your nights.")
+                .font(.system(size: welcomeTitleSize, weight: .bold))
                 .foregroundStyle(Obs.ink)
                 .fixedSize(horizontal: false, vertical: true)
-            RingArc()
-                .frame(height: 170)
-                .padding(.vertical, 24)
+            Image("RingHero")
+                .resizable().scaledToFit()
+                .frame(maxWidth: .infinity).frame(height: 265)
+                .padding(.vertical, 14)
                 .accessibilityHidden(true)
-            Text("Connect directly to your Oura ring over Bluetooth. See its sleep stages, including REM, alongside heart and movement patterns.")
-                .font(Obs.prose(18))
+            Text("Connect to your Oura ring over Bluetooth. Explore REM, deep sleep, and the signals behind each night.")
+                .font(.system(size: 17))
                 .foregroundStyle(Obs.ink2)
                 .fixedSize(horizontal: false, vertical: true)
             if let error {
@@ -1043,11 +1409,12 @@ struct RootView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Button { showSync = true } label: {
-                Label("Pair or sync your ring", systemImage: "waveform.path")
+                HStack { Text("Get started"); Spacer(); Image(systemName: "arrow.right") }
                     .font(.body.weight(.semibold))
                     .foregroundStyle(Obs.paper)
+                    .padding(.horizontal, 20)
                     .frame(maxWidth: .infinity, minHeight: 54)
-                    .background(Obs.link, in: RoundedRectangle(cornerRadius: 16))
+                    .background(Obs.ink, in: RoundedRectangle(cornerRadius: 18))
             }
             .buttonStyle(.plain)
             .padding(.top, 30)
@@ -1056,13 +1423,30 @@ struct RootView: View {
                 .foregroundStyle(Obs.link)
                 .frame(maxWidth: .infinity, minHeight: 48)
                 .padding(.top, 10)
-            Text("A ring already paired with another app needs its existing pairing key. A factory-reset ring can be paired here; resetting erases unsynced ring data.")
-                .font(.footnote)
-                .foregroundStyle(Obs.muted)
-                .padding(.top, 18)
-                .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.top, 38)
+        .padding(.top, 44)
+    }
+
+    private var connectedEmpty: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            SpaceEmptyState(symbol: "moon.stars.fill", title: "Your first night is on its way",
+                            message: "Your ring is connected. Wear it overnight, then let Oring collect the sleep stages and signals it recorded.")
+            Button { showSync = true } label: {
+                HStack { Text("Sync your ring"); Spacer(); Image(systemName: "arrow.right") }
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(Obs.paper)
+                    .padding(.horizontal, 20)
+                    .frame(maxWidth: .infinity, minHeight: 54)
+                    .background(Obs.ink, in: RoundedRectangle(cornerRadius: 18))
+            }
+            .buttonStyle(.plain)
+            .padding(.top, 18)
+            Button("Explore a sample night") { showSample = true }
+                .font(.body.weight(.medium))
+                .foregroundStyle(Obs.link)
+                .frame(maxWidth: .infinity, minHeight: 48)
+        }
+        .padding(.top, 100)
     }
 
     @ViewBuilder private func content(_ s: Summary) -> some View {
@@ -1074,18 +1458,21 @@ struct RootView: View {
         ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text("Oring").font(.system(.title2, design: .serif)).foregroundStyle(Obs.ink)
-                        Text("beta").font(Obs.mono(9, .medium)).tracking(1.2).foregroundStyle(Obs.muted)
+                        Text("oring").font(.system(size: 23, weight: .semibold)).foregroundStyle(Obs.ink)
                         Spacer()
                         Button { showProfile = true } label: {
                             Image(systemName: "person.crop.circle")
                                 .font(.system(size: 17)).foregroundStyle(Obs.ink2)
+                                .frame(width: 44, height: 44)
                         }
+                        .accessibilityLabel("Profile")
                         SyncIndicatorButton(ring: ring) { showSync = true }
                     }
 
                     if s.error != nil || (s.days.isEmpty && s.device == nil) {
                         ringWelcome(error: s.error)
+                    } else if s.days.isEmpty {
+                        connectedEmpty
                     } else {
                         // digest headline
                         if let d = s.digest {
@@ -1116,6 +1503,19 @@ struct RootView: View {
                                       onActivity: { report = ReportSel(day: day, sleep: false) })
                         }
 
+                        Button { withAnimation(.easeInOut(duration: 0.25)) { showMoreInsights.toggle() } } label: {
+                            HStack {
+                                Text(showMoreInsights ? "Fewer insights" : "More insights")
+                                    .font(.body.weight(.medium))
+                                Spacer()
+                                Image(systemName: showMoreInsights ? "chevron.up" : "chevron.down")
+                                    .font(.caption.weight(.semibold))
+                            }
+                            .foregroundStyle(Obs.link)
+                            .frame(minHeight: 52)
+                        }
+                        .buttonStyle(.plain)
+                        if showMoreInsights {
                         // vitals
                         ObsRule()
                         ObsTag("vitals", icon: "waveform.path.ecg")
@@ -1213,21 +1613,7 @@ struct RootView: View {
                             }
                         }
 
-                        // device & data health
-                        ObsRule()
-                        ObsTag("device", icon: "cpu")
-                        VStack(spacing: 10) {
-                            ObsStat(label: "serial", value: s.device?.serial ?? "–")
-                            ObsStat(label: "firmware", value: s.device?.firmware ?? "–")
-                            ObsStat(label: "battery",
-                                    value: s.device?.battery_pct.map { "\($0)%" } ?? "–",
-                                    accent: (s.device?.battery_pct ?? 100) < 20 ? Obs.bad : Obs.ink)
-                            ObsStat(label: "synced",
-                                    value: s.device.flatMap { d in d.synced.map { "\($0) \(d.synced_hm ?? "")" } } ?? "–")
                         }
-                        BuildStamp(prefix: s.device?.days_of_data.map {
-                            "\(String(format: "%.0f", $0)) days · \(s.device?.nights ?? s.nights.count) nights"
-                        })
                     }
                 }
                 .padding(.horizontal, 24).padding(.top, 12).padding(.bottom, 24)
@@ -1235,85 +1621,18 @@ struct RootView: View {
     }
 }
 
-/// Which build is actually on this phone. A sideloaded app has no App Store version
-/// to compare against, and a failed install looks exactly like a successful one — so
-/// show the version, when this binary was signed, and when its free-account
-/// certificate stops launching (7 days).
-struct BuildStamp: View {
-    var prefix: String? = nil
-    private static let signedAt: Date? = {
-        guard let path = Bundle.main.executableURL?.path,
-              let attrs = try? FileManager.default.attributesOfItem(atPath: path) else { return nil }
-        return attrs[.modificationDate] as? Date
-    }()
-
-    private static let stampFormat: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "MMM d HH:mm"
-        return f
-    }()
-
-    private static let dayFormat: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "MMM d"
-        return f
-    }()
-
-    private var line: String {
-        let info = Bundle.main.infoDictionary
-        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
-        let build = info?["CFBundleVersion"] as? String ?? "?"
-        var out = "Oring \(short) (\(build)) · \(coreVersion())"
-        if let prefix { out = prefix + " · " + out }
-        if let signed = Self.signedAt {
-            out += " · built \(Self.stampFormat.string(from: signed))"
-            if let expiry = Calendar.current.date(byAdding: .day, value: 7, to: signed) {
-                let days = Calendar.current.dateComponents([.day], from: Date(), to: expiry).day ?? 0
-                out += days < 0
-                    ? " · signing expired"
-                    : " · signing good to \(Self.dayFormat.string(from: expiry))"
-            }
-        }
-        return out
-    }
-
-    var body: some View {
-        Text(line)
-            .font(Obs.mono(10))
-            .foregroundStyle(Obs.muted)
-            .multilineTextAlignment(.center)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .center)
-            .padding(.top, 6)
-            .textSelection(.enabled)
-    }
-}
-
 @main
 struct OuraApp: App {
-    init() { DiagStore.shared.bootstrap() }
-    var body: some Scene { WindowGroup { RootView() } }
+    init() {
+        DiagStore.shared.bootstrap()
+        BackgroundSync.shared.register()
+    }
+    var body: some Scene { WindowGroup { RootView().preferredColorScheme(.dark) } }
 }
 
-private struct RingArc: View {
+struct SpaceBackdrop: View {
     var body: some View {
-        GeometryReader { proxy in
-            let size = proxy.size
-            ZStack {
-                Path { path in
-                    path.move(to: CGPoint(x: 12, y: size.height * 0.75))
-                    path.addQuadCurve(to: CGPoint(x: size.width - 12, y: size.height * 0.75),
-                                      control: CGPoint(x: size.width / 2, y: -size.height * 0.42))
-                }
-                .stroke(Obs.rule, lineWidth: 1.5)
-                Circle().fill(Obs.link).frame(width: 12, height: 12)
-                    .position(x: size.width * 0.56, y: size.height * 0.17)
-                Circle().fill(Obs.chart).frame(width: 5, height: 5)
-                    .position(x: size.width * 0.17, y: size.height * 0.55)
-                Circle().fill(Obs.chart).frame(width: 5, height: 5)
-                    .position(x: size.width * 0.83, y: size.height * 0.55)
-                Obs.rule.frame(height: 1).position(x: size.width / 2, y: size.height * 0.75)
-            }
-        }
+        Obs.paper.ignoresSafeArea()
+        .accessibilityHidden(true)
     }
 }

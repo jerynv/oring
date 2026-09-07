@@ -229,13 +229,17 @@ struct Rule: View {
 // A big mono datum with a tiny uppercase caption — the readout atom.
 struct Readout: View {
     @ScaledMetric(relativeTo: .title3) private var valueSize: CGFloat = 20
-    @ScaledMetric(relativeTo: .caption2) private var captionSize: CGFloat = 9
+    @ScaledMetric(relativeTo: .caption2) private var captionSize: CGFloat = 11
     let value: String
     let caption: String
     var accent: Color = Obs.ink
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(value).font(Obs.mono(valueSize, .medium)).foregroundStyle(accent).monospacedDigit()
+            if value == "–" {
+                Text("Awaiting data").font(.subheadline).foregroundStyle(Obs.muted)
+            } else {
+                Text(value).font(Obs.mono(valueSize, .medium)).foregroundStyle(accent).monospacedDigit()
+            }
             Text(caption.uppercased()).font(Obs.mono(captionSize)).tracking(1.2).foregroundStyle(Obs.ink2)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -245,6 +249,7 @@ struct Readout: View {
 // ── the polysomnograph: hypnogram + aligned signal lanes + a touch scrubber ──
 struct Polysomnograph: View {
     let night: NightRow
+    var showSignals = true
     @State private var cursorF: Double? = nil
     @ScaledMetric(relativeTo: .caption) private var gutterW: CGFloat = 76
     @ScaledMetric(relativeTo: .body) private var hypH: CGFloat = 84
@@ -252,7 +257,7 @@ struct Polysomnograph: View {
     @ScaledMetric(relativeTo: .caption) private var axisH: CGFloat = 22
     @ScaledMetric(relativeTo: .caption) private var labelSize: CGFloat = 11
     @ScaledMetric(relativeTo: .caption) private var valueSize: CGFloat = 12
-    @ScaledMetric(relativeTo: .caption) private var axisSize: CGFloat = 10
+    @ScaledMetric(relativeTo: .caption) private var axisSize: CGFloat = 11
 
     private struct Lane { let label: String; let unit: String; let signal: SignalLane?; let stages: [Int]? }
     private struct SignalLane { let v: [Double]; let color: Color; let dp: Int; let span: [Double] }
@@ -268,12 +273,14 @@ struct Polysomnograph: View {
                             signal: SignalLane(v: v, color: color, dp: dp,
                                                span: coverage), stages: nil))
         }
-        let s = night.series
-        sig("Heart rate", "bpm", s?.hr, Obs.chart)
-        sig("HRV", "ms", s?.hrv, Obs.chart)
-        sig("Blood O₂", "%", s?.spo2, Obs.chart)
-        sig("Skin temp", "°C", s?.temp, Obs.chart, 1, span: s?.temp_span)
-        sig("Motion", "s", s?.motion, Obs.chart)
+        if showSignals {
+            let s = night.series
+            sig("Heart rate", "bpm", s?.hr, Obs.chart)
+            sig("HRV", "ms", s?.hrv, Obs.chart)
+            sig("Blood O₂", "%", s?.spo2, Obs.chart)
+            sig("Skin temp", "°C", s?.temp, Obs.chart, 1, span: s?.temp_span)
+            sig("Motion", "s", s?.motion, Obs.chart)
+        }
         return out
     }
 
@@ -812,14 +819,15 @@ struct SleepDebtDetail: View {
                             Text(debtDuration(debt.debt_min)).font(Obs.mono(34, .medium)).foregroundStyle(Obs.debt(debt.state))
                             Text(debtStateCopy(debt.state)).font(Obs.prose(16)).foregroundStyle(Obs.ink2)
                         } else {
-                            Text("Not enough data yet").font(Obs.prose(22, .semibold)).foregroundStyle(Obs.ink)
-                            Text("\(debt.valid_days) of 5 sleep days available within the past 2 weeks.")
-                                .font(Obs.mono(12)).foregroundStyle(Obs.ink2)
+                            SpaceEmptyState(symbol: "bed.double", title: "A few more nights",
+                                            message: "\(debt.valid_days) of 5 sleep days are available. Keep wearing your ring to build a useful baseline.")
                         }
-                        Picker("Graph", selection: $graph) {
-                            ForEach(DebtGraph.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-                        }.pickerStyle(.segmented)
-                        SleepDebtChart(debt: debt, mode: graph)
+                        if debt.valid {
+                            Picker("Graph", selection: $graph) {
+                                ForEach(DebtGraph.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                            }.pickerStyle(.segmented)
+                            SleepDebtChart(debt: debt, mode: graph)
+                        }
                         Rule("how it works")
                         Text("Sleep debt estimates missed sleep over the past 14 days. Total sleep combines main sleep and naps, recent days carry more weight, and your sleep need (\(debtDuration(debt.need_h * 60))) is personalized from your typical sleep over the past 3 months, ignoring unusually short or long days.")
                             .font(Obs.prose(14)).foregroundStyle(Obs.ink2).fixedSize(horizontal: false, vertical: true)
@@ -1006,6 +1014,8 @@ struct DayReportView: View {
 
 struct SleepReport: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @State private var showSignals = false
+    @State private var showMetrics = false
     let s: Summary
     let day: String
     var body: some View {
@@ -1013,22 +1023,16 @@ struct SleepReport: View {
             let metrics = (n.stages.flatMap { st in Sleep.metrics(st, inBedS: (n.in_bed_h ?? 0) * 3600) })
             let asleepH = metrics.map { $0.asleepMin / 60 }
 
-            // Summary readouts use two columns when accessibility text needs room.
-            if dynamicTypeSize.isAccessibilitySize {
-                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], alignment: .leading, spacing: 22) {
-                    Readout(value: n.in_bed_h.map { String(format: "%.1f h", $0) } ?? "–", caption: "in bed")
-                    Readout(value: asleepH.map { String(format: "%.1f h", $0) } ?? "–", caption: "asleep")
-                    Readout(value: n.efficiency.map { "\(Int($0))%" } ?? "–", caption: "efficiency")
-                    Readout(value: "\(n.start ?? "–")–\(n.end ?? "–")", caption: "bedtime")
-                }
-            } else {
-                HStack(alignment: .top, spacing: 0) {
-                    Readout(value: n.in_bed_h.map { String(format: "%.1f h", $0) } ?? "–", caption: "in bed")
-                    Readout(value: asleepH.map { String(format: "%.1f h", $0) } ?? "–", caption: "asleep")
-                    Readout(value: n.efficiency.map { "\(Int($0))%" } ?? "–", caption: "efficiency")
-                    Readout(value: "\(n.start ?? "–")–\(n.end ?? "–")", caption: "bedtime")
-                }
+            HStack(alignment: .top, spacing: 28) {
+                Readout(value: asleepH.map { String(format: "%.1f h", $0) } ?? "–", caption: "asleep")
+                Readout(value: n.rem_pct.map { "\(Int($0))%" } ?? "–", caption: "REM sleep")
             }
+            HStack(spacing: 8) {
+                if let start = n.start, let end = n.end { Text("\(start)–\(end)") }
+                if let efficiency = n.efficiency { Text("\(Int(efficiency))% efficient") }
+            }
+            .font(.footnote)
+            .foregroundStyle(Obs.ink2)
 
             if let score = n.sleep_score {
                 Rule("sleep score")
@@ -1036,18 +1040,42 @@ struct SleepReport: View {
             }
 
             if n.hasHypnogram {
-                Rule("Sleep stages & signals")
-                stageLegend
-                Polysomnograph(night: n)
-
                 Rule("Sleep stages")
-                StageBar(n: n)
+                stageLegend
+                Polysomnograph(night: n, showSignals: showSignals)
+                Button { withAnimation(.easeInOut(duration: 0.25)) { showSignals.toggle() } } label: {
+                    HStack {
+                        Text(showSignals ? "Hide overnight signals" : "Explore heart, oxygen & movement")
+                        Spacer()
+                        Image(systemName: showSignals ? "chevron.up" : "chevron.down")
+                    }
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(Obs.link)
+                    .frame(minHeight: 48)
+                }
+                .buttonStyle(.plain)
+
+                if [n.deep_pct, n.light_pct, n.rem_pct, n.wake_pct].allSatisfy({ $0 != nil }) {
+                    StageBar(n: n)
+                }
                 HStack(spacing: 16) {
                     ForEach([("Deep", n.deep_pct), ("Light", n.light_pct), ("REM", n.rem_pct), ("Awake", n.wake_pct)], id: \.0) { name, pct in
                         Text(name).font(Obs.mono(11)).foregroundStyle(Obs.ink2)
-                            + Text(" \(Int(pct ?? 0))%").font(Obs.mono(11, .medium)).foregroundStyle(Obs.ink)
+                            + Text(" \(pct.map { "\(Int($0))%" } ?? "pending")").font(Obs.mono(11, .medium)).foregroundStyle(Obs.ink)
                     }
                 }
+                Button { withAnimation(.easeInOut(duration: 0.25)) { showMetrics.toggle() } } label: {
+                    HStack {
+                        Text(showMetrics ? "Hide sleep details" : "See sleep details")
+                        Spacer()
+                        Image(systemName: showMetrics ? "chevron.up" : "chevron.down")
+                    }
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(Obs.link)
+                    .frame(minHeight: 48)
+                }
+                .buttonStyle(.plain)
+                if showMetrics {
                 if let m = metrics { clinicalGrid(m) }
 
                 let auto = Sleep.autonomic(hr: n.series?.hr ?? [], hrv: n.series?.hrv ?? [],
@@ -1059,17 +1087,19 @@ struct SleepReport: View {
 
                 Rule("Sleep summary")
                 interpretation(n, metrics)
+                }
             } else {
                 // This night has signals but no staged sleep epochs from the ring.
                 if hasAnySeries(n) {
                     Rule("overnight signals")
                     Polysomnograph(night: n)
                 }
-                Text("Sleep analysis is not available for this night yet.")
-                    .font(Obs.mono(12)).foregroundStyle(Obs.ink2).fixedSize(horizontal: false, vertical: true)
+                SpaceEmptyState(symbol: "moon.zzz", title: "Stages haven’t arrived",
+                                message: "This night has no sleep-stage stream from the ring. Sync again after wearing it overnight.")
             }
         } else {
-            Text("No sleep recorded for this night.").font(Obs.mono(13)).foregroundStyle(Obs.ink2)
+            SpaceEmptyState(symbol: "moon.stars", title: "No night recorded",
+                            message: "The ring has not sent sleep for this date. Try another day or sync again after your next night.")
         }
     }
 
@@ -1187,10 +1217,14 @@ struct ActivityReport: View {
         let prof = s.activity_profile[day] ?? []
         let steps = compactSteps(st?.steps)
 
+        if st == nil && prof.isEmpty && s.workoutsOn(day).isEmpty {
+            SpaceEmptyState(symbol: "figure.walk.motion", title: "No movement yet",
+                            message: "The ring has not sent activity for this date. Sync again after wearing it during the day.")
+        } else {
         HStack(alignment: .top, spacing: 0) {
             Readout(value: steps.value, caption: steps.unit)
-            Readout(value: st.map { "\(Int($0.active_kcal ?? 0))" } ?? "–", caption: "active kcal")
-            Readout(value: st.map { "\(Int($0.total_kcal ?? 0))" } ?? "–", caption: "total kcal")
+            Readout(value: st.flatMap(\.active_kcal).map { "\(Int($0))" } ?? "–", caption: "active kcal")
+            Readout(value: st.flatMap(\.total_kcal).map { "\(Int($0))" } ?? "–", caption: "total kcal")
             if let d = st?.distance_m { Readout(value: String(format: "%.1f", d / 1000), caption: "distance · km") }
         }
 
@@ -1211,11 +1245,13 @@ struct ActivityReport: View {
         let ws = s.workoutsOn(day)
         Rule("sessions")
         if ws.isEmpty {
-            Text("No sessions detected this day.").font(Obs.mono(12)).foregroundStyle(Obs.ink2)
+            Label("No workouts recorded this day", systemImage: "figure.walk")
+                .font(.subheadline).foregroundStyle(Obs.muted)
         } else {
             VStack(spacing: 14) {
                 ForEach(ws) { w in SessionRow(label: w.label, durationMin: w.durationMin, startHM: w.startHM) }
             }
+        }
         }
     }
 }

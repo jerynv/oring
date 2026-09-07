@@ -1,5 +1,6 @@
 import CoreBluetooth
 import Foundation
+import UIKit
 
 // Native CoreBluetooth implementation of the ring link — the iOS counterpart to
 // `oura-link::ble` (btleplug), conforming to the same shape as the Rust
@@ -33,7 +34,7 @@ protocol RingTransport: AnyObject {
 }
 
 enum BLEError: Error, CustomStringConvertible {
-    case poweredOff, notFound, noWriteCharacteristic, disconnected, busy
+    case poweredOff, notFound, noWriteCharacteristic, disconnected, busy, staleBond
     case ringNotAdvertising(otherDevices: Int)
     /// carries the stage the attempt was in, so "timed out" says *what* never happened
     /// (no advertisement seen vs GATT connect stalled vs subscriptions pending).
@@ -47,8 +48,18 @@ enum BLEError: Error, CustomStringConvertible {
         case .noWriteCharacteristic: return "no write characteristic (98ED0002)"
         case .disconnected: return "ring disconnected"
         case .busy: return "another BLE operation is in flight"
+        case .staleBond: return "this iPhone still has an old Bluetooth pairing for the ring"
         case .timedOut(let stage): return "timed out while \(stage)"
         }
+    }
+
+    static func connectionFailure(_ error: Error?) -> Error {
+        guard let error else { return BLEError.notFound }
+        let system = error as NSError
+        // CoreBluetooth error 14 means the ring discarded its pairing while iOS
+        // still remembers the bond. Retrying cannot repair the OS pairing cache.
+        if system.domain == CBErrorDomain && system.code == 14 { return BLEError.staleBond }
+        return error
     }
 }
 
@@ -161,7 +172,10 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
 
     private func startScan() {
         lock.lock(); stage = "scanning; no ring advertisement seen yet"; lock.unlock()
-        dlog("ble", "scanning (unfiltered, allow duplicates); matching service \(RingUUID.service)")
+        let background = UIApplication.shared.applicationState != .active
+        dlog("ble", background
+             ? "scanning in background for service \(RingUUID.service)"
+             : "scanning (unfiltered, allow duplicates); matching service \(RingUUID.service)")
         // UNFILTERED scan, matching done in didDiscover: an OS-side service filter
         // reports nothing when the ring isn't advertising, which is indistinguishable
         // from broken Bluetooth. Seeing (and counting) other devices' advertisements
@@ -171,8 +185,8 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
         // scan response, which a worn ring in low-power mode answers lazily. Without
         // duplicates iOS may coalesce the ring into a single early, name-less report.
         central.scanForPeripherals(
-            withServices: nil,
-            options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+            withServices: background ? [RingUUID.service] : nil,
+            options: background ? nil : [CBCentralManagerScanOptionAllowDuplicatesKey: true])
     }
 
     /// Finish the inbound frame stream so a Rust drain blocked on `recv` returns at once
@@ -301,7 +315,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
                         error: Error?) {
         guard !closed, self.peripheral === peripheral else { return }
         dlog("ble", "GATT connect FAILED: \(error.map { String(describing: $0) } ?? "no error info")")
-        finishConnect(.failure(error ?? BLEError.notFound))
+        finishConnect(.failure(BLEError.connectionFailure(error)))
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral,
@@ -312,7 +326,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
         closed = true
         // don't strand a caller awaiting a connect or write when the link drops.
         finishWrite(.failure(BLEError.disconnected))
-        finishConnect(.failure(BLEError.disconnected))
+        finishConnect(.failure(error.map(BLEError.connectionFailure) ?? BLEError.disconnected))
     }
 
     // ── CBPeripheralDelegate ──
